@@ -7,7 +7,7 @@ Common utils for tests
 """
 import tempfile
 import os
-
+import random 
 from gensim.corpora import Dictionary
 
 module_path = os.path.dirname(__file__)  # needed because sample data files are located in the same folder
@@ -24,7 +24,8 @@ def get_tmpfile(suffix):
 
     Function doesn't create file. Double calling with the same suffix can return different paths.
     """
-    return os.path.join(tempfile.gettempdir(), suffix)
+    randpart = hex(random.randint(0, 0xffffff))[2:]
+    return os.path.join(tempfile.gettempdir(), randpart + suffix)
 
 
 # set up vars used in testing ("Deerwester" from the web tutorial)

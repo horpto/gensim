@@ -16,15 +16,11 @@ import numbers
 import six
 import numpy as np
 
-from gensim.corpora import mmcorpus, Dictionary
+from gensim.corpora import mmcorpus
 from gensim.models import ldamodel, ldamulticore
 from gensim import matutils, utils
 from gensim.test import basetmtests
-from gensim.test.utils import datapath, get_tmpfile, common_texts
-
-dictionary = Dictionary(common_texts)
-corpus = [dictionary.doc2bow(text) for text in common_texts]
-
+from gensim.test.utils import datapath, get_tmpfile, common_texts, common_dictionary as dictionary, common_corpus as corpus
 
 def testRandomState():
     testcases = [np.random.seed(0), None, np.random.RandomState(0), 0]
@@ -322,15 +318,15 @@ class TestLdaModel(unittest.TestCase, basetmtests.TestBaseTopicModel):
         # long message includes the original error message with a custom one
         self.longMessage = True
         # construct what we expect when passes aren't involved
-        test_rhots = list()
+        test_rhots = []
         model = self.class_(id2word=dictionary, chunksize=1, num_topics=2)
-
+        corpus = self.corpus
         def final_rhot(model):
             return pow(model.offset + (1 * model.num_updates) / model.chunksize, -model.decay)
 
         # generate 5 updates to test rhot on
         for x in range(5):
-            model.update(self.corpus)
+            model.update(corpus)
             test_rhots.append(final_rhot(model))
 
         for passes in [1, 5, 10, 50, 100]:
@@ -338,7 +334,7 @@ class TestLdaModel(unittest.TestCase, basetmtests.TestBaseTopicModel):
             self.assertEqual(final_rhot(model), 1.0)
             # make sure the rhot matches the test after each update
             for test_rhot in test_rhots:
-                model.update(self.corpus)
+                model.update(corpus)
 
                 msg = ", ".join(str(x) for x in [passes, model.num_updates, model.state.numdocs])
                 self.assertAlmostEqual(final_rhot(model), test_rhot, msg=msg)

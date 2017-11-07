@@ -21,10 +21,7 @@ from gensim.models.wrappers import ldamallet
 from gensim import matutils
 from gensim.models import ldamodel
 from gensim.test import basetmtests
-from gensim.test.utils import datapath, get_tmpfile, common_texts
-
-dictionary = Dictionary(common_texts)
-corpus = [dictionary.doc2bow(text) for text in common_texts]
+from gensim.test.utils import datapath, get_tmpfile, common_dictionary as dictionary, common_corpus as corpus
 
 
 class TestLdaMallet(unittest.TestCase, basetmtests.TestBaseTopicModel):

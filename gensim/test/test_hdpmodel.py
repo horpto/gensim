@@ -12,22 +12,19 @@ Automated tests for checking transformation algorithms (the models package).
 import logging
 import unittest
 
-from gensim.corpora import mmcorpus, Dictionary
+from gensim.corpora.mmcorpus import MmCorpus
 from gensim.models import hdpmodel
 from gensim.test import basetmtests
-from gensim.test.utils import datapath, common_texts
+from gensim.test.utils import datapath, common_dictionary, common_corpus
 
 import numpy as np
-
-dictionary = Dictionary(common_texts)
-corpus = [dictionary.doc2bow(text) for text in common_texts]
 
 
 class TestHdpModel(unittest.TestCase, basetmtests.TestBaseTopicModel):
     def setUp(self):
-        self.corpus = mmcorpus.MmCorpus(datapath('testcorpus.mm'))
+        self.corpus = MmCorpus(datapath('testcorpus.mm'))
         self.class_ = hdpmodel.HdpModel
-        self.model = self.class_(corpus, id2word=dictionary, random_state=np.random.seed(0))
+        self.model = self.class_(common_corpus, id2word=common_dictionary, random_state=np.random.seed(0))
 
     def testTopicValues(self):
         """
