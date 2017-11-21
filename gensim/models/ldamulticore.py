@@ -141,6 +141,10 @@ class LdaMulticore(LdaModel):
         """
         self.workers = max(1, cpu_count() - 1) if workers is None else workers
         self.batch = batch
+        
+        self.job_queue = Queue(maxsize=2 * self.workers)
+        self.result_queue = Queue()
+        self.pool = Pool(self.workers, worker_e_step, (self.job_queue, self.result_queue,))
 
         if isinstance(alpha, six.string_types) and alpha == 'auto':
             raise NotImplementedError("auto-tuning alpha not implemented in multicore LDA; use plain LdaModel.")
@@ -152,6 +156,10 @@ class LdaMulticore(LdaModel):
             gamma_threshold=gamma_threshold, random_state=random_state, minimum_probability=minimum_probability,
             minimum_phi_value=minimum_phi_value, per_word_topics=per_word_topics, dtype=dtype
         )
+
+    def __del__(self):
+        if self.pool is not None:
+            self.pool.terminate()
 
     def update(self, corpus, chunks_as_numpy=False):
         """
@@ -205,8 +213,9 @@ class LdaMulticore(LdaModel):
                 "consider increasing the number of passes or iterations to improve accuracy"
             )
 
-        job_queue = Queue(maxsize=2 * self.workers)
-        result_queue = Queue()
+        job_queue,self.job_queue = self.job_queue, None
+        result_queue, self.result_queue = self.result_queue, None
+        pool, self.pool = self.pool, None
 
         # rho is the "speed" of updating; TODO try other fncs
         # pass_ + num_updates handles increasing the starting t for each pass,
@@ -214,30 +223,29 @@ class LdaMulticore(LdaModel):
         def rho():
             return pow(self.offset + pass_ + (self.num_updates / self.chunksize), -self.decay)
 
+        def process_result_queue(other, queue_size, chunk, force=False):
+            """
+            Clear the result queue, merging all intermediate results, and update the
+            LDA model if necessary.
+
+            """
+            merged_new = False
+            while not result_queue.empty():
+                other.merge(result_queue.get())
+                queue_size[0] -= 1
+                merged_new = True
+            if (force and merged_new and queue_size[0] == 0) or (not self.batch and (other.numdocs >= updateafter)):
+                self.do_mstep(rho(), other, pass_ > 0)
+                other.reset()
+                if self.eval_every is not None and \
+                        ((force and queue_size[0] == 0) or
+                                (self.eval_every != 0 and (self.num_updates / updateafter) % self.eval_every == 0)):
+                    self.log_perplexity(chunk, total_docs=lencorpus)
+
         logger.info("training LDA model using %i processes", self.workers)
-        pool = Pool(self.workers, worker_e_step, (job_queue, result_queue,))
         for pass_ in xrange(self.passes):
             queue_size, reallen = [0], 0
             other = LdaState(self.eta, self.state.sstats.shape)
-
-            def process_result_queue(force=False):
-                """
-                Clear the result queue, merging all intermediate results, and update the
-                LDA model if necessary.
-
-                """
-                merged_new = False
-                while not result_queue.empty():
-                    other.merge(result_queue.get())
-                    queue_size[0] -= 1
-                    merged_new = True
-                if (force and merged_new and queue_size[0] == 0) or (not self.batch and (other.numdocs >= updateafter)):
-                    self.do_mstep(rho(), other, pass_ > 0)
-                    other.reset()
-                    if self.eval_every is not None and \
-                            ((force and queue_size[0] == 0) or
-                                 (self.eval_every != 0 and (self.num_updates / updateafter) % self.eval_every == 0)):
-                        self.log_perplexity(chunk, total_docs=lencorpus)
 
             chunk_stream = utils.grouper(corpus, self.chunksize, as_numpy=chunks_as_numpy)
             for chunk_no, chunk in enumerate(chunk_stream):
@@ -258,20 +266,22 @@ class LdaMulticore(LdaModel):
                     except queue.Full:
                         # in case the input job queue is full, keep clearing the
                         # result queue, to make sure we don't deadlock
-                        process_result_queue()
+                        process_result_queue(other, queue_size, chunk)
 
-                process_result_queue()
+                process_result_queue(other, queue_size, chunk)
             # endfor single corpus pass
 
             # wait for all outstanding jobs to finish
             while queue_size[0] > 0:
-                process_result_queue(force=True)
+                process_result_queue(other, queue_size, chunk, force=True)
 
             if reallen != lencorpus:
                 raise RuntimeError("input corpus size changed during training (don't use generators as input)")
         # endfor entire update
 
-        pool.terminate()
+        self.job_queue = job_queue
+        self.result_queue = result_queue
+        self.pool = pool
 
 
 def worker_e_step(input_queue, result_queue):
