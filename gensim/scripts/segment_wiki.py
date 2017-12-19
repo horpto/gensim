@@ -45,6 +45,7 @@ import multiprocessing
 import re
 import sys
 from xml.etree import cElementTree
+from time import perf_counter as time
 
 
 from gensim.corpora.wikicorpus import IGNORED_NAMESPACES, WikiCorpus, filter_wiki, get_namespace, utils
@@ -74,13 +75,10 @@ def segment_all_articles(file_path, min_article_character=200, workers=None):
         Structure contains (title, [(section_heading, section_content), ...]).
 
     """
-    with smart_open(file_path, 'rb') as xml_fileobj:
-        wiki_sections_corpus = _WikiSectionsCorpus(
-            xml_fileobj, min_article_character=min_article_character, processes=workers)
-        wiki_sections_corpus.metadata = True
-        wiki_sections_text = wiki_sections_corpus.get_texts_with_sections()
-        for article_title, article_sections in wiki_sections_text:
-            yield article_title, article_sections
+    wiki_sections_corpus = _WikiSectionsCorpus(
+        file_path, min_article_character=min_article_character, processes=workers)
+    wiki_sections_corpus.metadata = True
+    return wiki_sections_corpus.get_texts_with_sections()
 
 
 def segment_and_write_all_articles(file_path, output_file, min_article_character=200, workers=None):
@@ -111,7 +109,7 @@ def segment_and_write_all_articles(file_path, output_file, min_article_character
     if output_file is None:
         outfile = sys.stdout
     else:
-        outfile = smart_open(output_file, 'wb')
+        outfile = smart_open(output_file, 'w')
 
     try:
         article_stream = segment_all_articles(file_path, min_article_character, workers=workers)
@@ -127,12 +125,12 @@ def segment_and_write_all_articles(file_path, output_file, min_article_character
         outfile.close()
 
 
-def extract_page_xmls(f):
+def extract_page_xmls(fd):
     """Extract pages from a MediaWiki database dump.
 
     Parameters
     ----------
-    f : file
+    fd : file
         File descriptor of MediaWiki dump.
 
     Yields
@@ -141,7 +139,7 @@ def extract_page_xmls(f):
         XML strings for page tags.
 
     """
-    elems = cElementTree.iterparse(f, events=("end",))
+    elems = cElementTree.iterparse(fd, events=("end",))
 
     _, elem = next(elems)
     namespace = get_namespace(elem.tag)
@@ -150,7 +148,7 @@ def extract_page_xmls(f):
 
     for _, elem in elems:
         if elem.tag == page_tag:
-            yield cElementTree.tostring(elem)
+            yield cElementTree.tostringlist(elem)
             # Prune the element tree, as per
             # http://www.ibm.com/developerworks/xml/library/x-hiperfparse/
             # except that we don't need to prune backlinks from the parent
@@ -175,7 +173,7 @@ def segment(page_xml):
         Structure contains (title, [(section_heading, section_content)]).
 
     """
-    elem = cElementTree.fromstring(page_xml)
+    elem = cElementTree.fromstringlist(page_xml)
     filter_namespaces = ('0',)
     namespace = get_namespace(elem.tag)
     ns_mapping = {"ns": namespace}
@@ -205,6 +203,55 @@ def segment(page_xml):
     return title, sections
 
 
+def receive_and_segment(xml_queue, out_queue):
+    try:
+        while True:
+            page_xmls = xml_queue.get()
+            out_queue.put([segment(page_xml) for page_xml in page_xmls])
+    except EOFError:
+        logger.info("Worker process '%s' catches end", multiprocessing.current_process.name)
+
+
+def extract_and_send_xmls(file_path, pool_size, out_queue):
+    """Extract pages from a MediaWiki database dump and send it to process pool
+
+
+    """
+    xml_queue = multiprocessing.Queue(100)
+    pool = multiprocessing.Pool(pool_size, receive_and_segment, (xml_queue, out_queue))
+    with smart_open(file_path, 'rb') as xml_fileobj:
+        page_xmls = extract_page_xmls(xml_fileobj)
+        for page_xml in utils.chunkize_serial(page_xmls, 10):
+            xml_queue.put(page_xml)
+    print('closing xml queue')
+    xml_queue.close()
+    xml_queue.join_thread()
+    print('waited back xml queue')
+    pool.close()
+    print('pool closed')
+    pool.join()
+    print('joined')
+    out_queue.close()
+    print("that's all!")
+
+
+def proceed_xmls(file_path, pool_size):
+    out_queue = multiprocessing.Queue(100)
+
+    parser_process = multiprocessing.Process(target=extract_and_send_xmls, args=(file_path, pool_size, out_queue))
+    parser_process.start()
+
+    try:
+        while parser_process.is_alive() or not out_queue.empty():
+            yield from out_queue.get()
+    except EOFError:
+        pass
+        print('qq')
+    finally:
+        print('yeah!')
+        parser_process.terminate()
+
+
 class _WikiSectionsCorpus(WikiCorpus):
     """Treat a wikipedia articles dump (<LANG>wiki-<YYYYMMDD>-pages-articles.xml.bz2
     or <LANG>wiki-latest-pages-articles.xml.bz2) as a (read-only) corpus.
@@ -212,13 +259,13 @@ class _WikiSectionsCorpus(WikiCorpus):
     The documents are extracted on-the-fly, so that the whole (massive) dump can stay compressed on disk.
 
     """
-    def __init__(self, fileobj, min_article_character=200, processes=None,
+    def __init__(self, fname, min_article_character=200, processes=None,
                  lemmatize=utils.has_pattern(), filter_namespaces=('0',)):
         """
         Parameters
         ----------
-        fileobj : file
-            File descriptor of MediaWiki dump.
+        fname : file
+            File path of MediaWiki dump.
         min_article_character : int, optional
             Minimal number of character for article (except titles and leading gaps).
         processes : int, optional
@@ -230,7 +277,7 @@ class _WikiSectionsCorpus(WikiCorpus):
             Enumeration of namespaces that will be ignored.
 
         """
-        self.fileobj = fileobj
+        self.fname = fname
         self.filter_namespaces = filter_namespaces
         self.metadata = False
         if processes is None:
@@ -261,9 +308,8 @@ class _WikiSectionsCorpus(WikiCorpus):
         """
         skipped_namespace, skipped_length, skipped_redirect = 0, 0, 0
         total_articles, total_sections = 0, 0
-        page_xmls = extract_page_xmls(self.fileobj)
-        pool = multiprocessing.Pool(self.processes)
-        for article_title, sections in pool.imap_unordered(segment, page_xmls, chunksize=10):
+
+        for article_title, sections in proceed_xmls(self.fname, self.processes):
             # article redirects are pruned here
             if any(article_title.startswith(ignore + ':') for ignore in IGNORED_NAMESPACES):  # filter non-articles
                 skipped_namespace += 1
@@ -282,7 +328,6 @@ class _WikiSectionsCorpus(WikiCorpus):
         logger.info(
             "finished processing %i articles with %i sections (skipped %i redirects, %i stubs, %i ignored namespaces)",
             total_articles, total_sections, skipped_redirect, skipped_length, skipped_namespace)
-        pool.terminate()
         self.length = total_articles  # cache corpus length
 
 
