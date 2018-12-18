@@ -341,5 +341,5 @@ def worker_e_step(input_queue, result_queue, worker_lda):
         del chunk
         logger.debug("processed chunk, queuing the result")
         result_queue.put(worker_lda.state)
-        worker_lda.state = None 
+        worker_lda.state = None
         logger.debug("result put")
