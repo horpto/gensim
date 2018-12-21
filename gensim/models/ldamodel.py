@@ -200,6 +200,22 @@ class LdaState(utils.SaveLoad):
         self.sstats += other.sstats
         self.numdocs += other.numdocs
 
+    def merge2(self, sstats, numdocs):
+        """Merge the result of an E step from one node with that of another node (summing up sufficient statistics).
+
+        The merging is trivial and after merging all cluster nodes, we have the
+        exact same result as if the computation was run on a single node (no
+        approximation).
+
+        Parameters
+        ----------
+        other : :class:`~gensim.models.ldamodel.LdaState`
+            The state object with which the current one will be merged.
+
+        """
+        self.sstats += sstats
+        self.numdocs += numdocs
+
     def blend(self, rhot, other, targetsize=None):
         """Merge the current state with another one using a weighted average for the sufficient statistics.
 

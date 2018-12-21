@@ -92,6 +92,7 @@ from gensim.models.ldamodel import LdaModel, LdaState
 import six
 from six.moves import queue, range
 from multiprocessing import Pool, Queue, cpu_count
+from multiprocessing.sharedctypes import Array, RawArray
 
 logger = logging.getLogger(__name__)
 
@@ -256,8 +257,17 @@ class LdaMulticore(LdaModel):
         def rho():
             return pow(self.offset + pass_ + (self.num_updates / self.chunksize), -self.decay)
 
+        expElogbeta_buffer = Array('c', self.expElogbeta.nbytes)
+        expElogbeta = np.frombuffer(expElogbeta_buffer.get_obj(), dtype=self.dtype).reshape(self.expElogbeta.shape)
+        np.copyto(expElogbeta, self.expElogbeta)
+
+        indices = set(range(2 * self.workers))
+        sstats_buffers = [RawArray('c', self.state.sstats.nbytes) for unused in indices]
+        sstats = [np.frombuffer(sstats_buffer, dtype=self.dtype).reshape(self.state.sstats.shape)
+            for sstats_buffer in sstats_buffers]
+
         logger.info("training LDA model using %i processes", self.workers)
-        pool = Pool(self.workers, worker_e_step, (job_queue, result_queue, self))
+        pool = Pool(self.workers, worker_e_step, (job_queue, result_queue, self, expElogbeta_buffer, sstats_buffers))
         for pass_ in range(self.passes):
             queue_size, reallen = [0], 0
             other = LdaState(self.eta, self.state.sstats.shape)
@@ -270,11 +280,18 @@ class LdaMulticore(LdaModel):
                 """
                 merged_new = False
                 while not result_queue.empty():
-                    other.merge(result_queue.get())
+                    numdocs, dst_index = result_queue.get()
+                    other.merge2(sstats[dst_index], numdocs)
+                    indices.add(dst_index)
+
                     queue_size[0] -= 1
                     merged_new = True
                 if (force and merged_new and queue_size[0] == 0) or (not self.batch and (other.numdocs >= updateafter)):
                     self.do_mstep(rho(), other, pass_ > 0)
+
+                    with expElogbeta_buffer:
+                        np.copyto(expElogbeta, self.expElogbeta)
+
                     other.reset()
                     if self.eval_every is not None \
                             and ((force and queue_size[0] == 0)
@@ -285,11 +302,12 @@ class LdaMulticore(LdaModel):
             for chunk_no, chunk in enumerate(chunk_stream):
                 reallen += len(chunk)  # keep track of how many documents we've processed so far
 
+                dst_index = indices.pop()
                 # put the chunk into the workers' input job queue
                 chunk_put = False
                 while not chunk_put:
                     try:
-                        job_queue.put((chunk_no, chunk, self.state), block=True, timeout=0.1)
+                        job_queue.put((chunk_no, chunk, dst_index), block=True, timeout=0.1)
                         chunk_put = True
                         queue_size[0] += 1
                         logger.info(
@@ -316,7 +334,7 @@ class LdaMulticore(LdaModel):
         pool.terminate()
 
 
-def worker_e_step(input_queue, result_queue, worker_lda):
+def worker_e_step(input_queue, result_queue, worker_lda, expElogbeta_buffer, result_bufers):
     """Perform E-step for each job.
 
     Parameters
@@ -330,16 +348,23 @@ def worker_e_step(input_queue, result_queue, worker_lda):
         LDA instance which performed e step
     """
     logger.debug("worker process entering E-step loop")
+    expElogbeta = np.frombuffer(expElogbeta_buffer.get_obj(), dtype=worker_lda.dtype).reshape(worker_lda.expElogbeta.shape)
+
+    results = [np.frombuffer(result, dtype=worker_lda.state.dtype).reshape(worker_lda.state.sstats.shape)
+        for result in result_bufers]
+
     while True:
         logger.debug("getting a new job")
-        chunk_no, chunk, w_state = input_queue.get()
+        chunk_no, chunk, dst_index = input_queue.get()
         logger.debug("processing chunk #%i of %i documents", chunk_no, len(chunk))
-        worker_lda.state = w_state
-        worker_lda.sync_state()
+        worker_lda.state.sstats = results[dst_index]
         worker_lda.state.reset()
+
+        with expElogbeta_buffer:
+            np.copyto(worker_lda.expElogbeta, expElogbeta)
+
         worker_lda.do_estep(chunk)  # TODO: auto-tune alpha?
         del chunk
         logger.debug("processed chunk, queuing the result")
-        result_queue.put(worker_lda.state)
-        worker_lda.state = None
+        result_queue.put((worker_lda.state.numdocs, dst_index))
         logger.debug("result put")
