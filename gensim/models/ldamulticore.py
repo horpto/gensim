@@ -83,6 +83,7 @@ Query, or update the model using new, unseen documents
 """
 
 import logging
+from time import perf_counter
 
 import numpy as np
 
@@ -214,6 +215,7 @@ class LdaMulticore(LdaModel):
             performance hit. For distributed computing it may be desirable to keep the chunks as `numpy.ndarray`.
 
         """
+        #chunks_as_numpy=True
         try:
             lencorpus = len(corpus)
         except TypeError:
@@ -261,7 +263,7 @@ class LdaMulticore(LdaModel):
         expElogbeta = np.frombuffer(expElogbeta_buffer.get_obj(), dtype=self.dtype).reshape(self.expElogbeta.shape)
         np.copyto(expElogbeta, self.expElogbeta)
 
-        indices = set(range(2 * self.workers))
+        indices = set(range(10 * self.workers))
         sstats_buffers = [RawArray('c', self.state.sstats.nbytes) for unused in indices]
         sstats = [np.frombuffer(sstats_buffer, dtype=self.dtype).reshape(self.state.sstats.shape)
             for sstats_buffer in sstats_buffers]
@@ -289,8 +291,8 @@ class LdaMulticore(LdaModel):
                 if (force and merged_new and queue_size[0] == 0) or (not self.batch and (other.numdocs >= updateafter)):
                     self.do_mstep(rho(), other, pass_ > 0)
 
-                    with expElogbeta_buffer:
-                        np.copyto(expElogbeta, self.expElogbeta)
+                    #with expElogbeta_buffer:
+                    np.copyto(expElogbeta, self.expElogbeta)
 
                     other.reset()
                     if self.eval_every is not None \
@@ -298,13 +300,14 @@ class LdaMulticore(LdaModel):
                             or (self.eval_every != 0 and (self.num_updates / updateafter) % self.eval_every == 0)):
                         self.log_perplexity(chunk, total_docs=lencorpus)
 
-            chunk_stream = utils.grouper(corpus, self.chunksize, as_numpy=chunks_as_numpy)
+            chunk_stream = utils.grouper(corpus, self.chunksize, as_numpy=chunks_as_numpy, dtype='i4,f4')
             for chunk_no, chunk in enumerate(chunk_stream):
                 reallen += len(chunk)  # keep track of how many documents we've processed so far
 
                 dst_index = indices.pop()
                 # put the chunk into the workers' input job queue
                 chunk_put = False
+                i = 0
                 while not chunk_put:
                     try:
                         job_queue.put((chunk_no, chunk, dst_index), block=True, timeout=0.1)
@@ -318,6 +321,8 @@ class LdaMulticore(LdaModel):
                     except queue.Full:
                         # in case the input job queue is full, keep clearing the
                         # result queue, to make sure we don't deadlock
+                        i += 1
+                        logger.debug('FULL: pass %s, chunk_no %i, i: %i, queue: %i', pass_, chunk_no, i, queue_size[0])
                         process_result_queue()
 
                 process_result_queue()
@@ -355,16 +360,20 @@ def worker_e_step(input_queue, result_queue, worker_lda, expElogbeta_buffer, res
 
     while True:
         logger.debug("getting a new job")
+        t0 = perf_counter()
         chunk_no, chunk, dst_index = input_queue.get()
-        logger.debug("processing chunk #%i of %i documents", chunk_no, len(chunk))
+        logger.debug("processing chunk #%i of %i documents, WAIT_TIME: %s", chunk_no, len(chunk), perf_counter()-t0)
         worker_lda.state.sstats = results[dst_index]
         worker_lda.state.reset()
 
-        with expElogbeta_buffer:
-            np.copyto(worker_lda.expElogbeta, expElogbeta)
+        #with expElogbeta_buffer:
+        t0 = perf_counter()
+        np.copyto(worker_lda.expElogbeta, expElogbeta)
+        logger.debug('COPY_TIME: %s', perf_counter() - t0)
 
+        t0 = perf_counter()
         worker_lda.do_estep(chunk)  # TODO: auto-tune alpha?
+        logger.debug("processed chunk, queuing the result. TIME: %s", perf_counter() - t0)
         del chunk
-        logger.debug("processed chunk, queuing the result")
         result_queue.put((worker_lda.state.numdocs, dst_index))
         logger.debug("result put")
