@@ -248,9 +248,6 @@ class LdaMulticore(LdaModel):
                 "consider increasing the number of passes or iterations to improve accuracy"
             )
 
-        job_queue = Queue(maxsize=2 * self.workers)
-        result_queue = Queue()
-
         # rho is the "speed" of updating; TODO try other fncs
         # pass_ + num_updates handles increasing the starting t for each pass,
         # while allowing it to "reset" on the first pass of each update
@@ -258,66 +255,34 @@ class LdaMulticore(LdaModel):
             return pow(self.offset + pass_ + (self.num_updates / self.chunksize), -self.decay)
 
         logger.info("training LDA model using %i processes", self.workers)
-        pool = Pool(self.workers, worker_e_step, (job_queue, result_queue,))
+        pool = utils.MapPool(worker_e_step, self.workers)
+
+        other = LdaState(self.eta, self.state.sstats.shape)  # temporary LdaState, reseted on every pass
+        eval_every = self.eval_every or 0
+
         for pass_ in range(self.passes):
-            queue_size, reallen = [0], 0
-            other = LdaState(self.eta, self.state.sstats.shape)
+            other.reset()
 
-            def process_result_queue(force=False):
-                """
-                Clear the result queue, merging all intermediate results, and update the
-                LDA model if necessary.
-
-                """
-                merged_new = False
-                while not result_queue.empty():
-                    other.merge(result_queue.get())
-                    queue_size[0] -= 1
-                    merged_new = True
-                if (force and merged_new and queue_size[0] == 0) or (not self.batch and (other.numdocs >= updateafter)):
+            mapper = pool.map(corpus, args=(self,), chunksize=self.chunksize, as_numpy=chunks_as_numpy)
+            for processed_state in mapper:
+                other.merge(processed_state)
+                if other.numdocs >= updateafter:
                     self.do_mstep(rho(), other, pass_ > 0)
                     other.reset()
-                    if self.eval_every is not None \
-                            and ((force and queue_size[0] == 0)
-                            or (self.eval_every != 0 and (self.num_updates / updateafter) % self.eval_every == 0)):
-                        self.log_perplexity(chunk, total_docs=lencorpus)
+                    if eval_every > 0 and (self.num_updates / updateafter) % eval_every == 0:
+                        self.log_perplexity(pool.chunk, total_docs=lencorpus)
 
-            chunk_stream = utils.grouper(corpus, self.chunksize, as_numpy=chunks_as_numpy)
-            for chunk_no, chunk in enumerate(chunk_stream):
-                reallen += len(chunk)  # keep track of how many documents we've processed so far
+            self.do_mstep(rho(), other, pass_ > 0)
+            self.log_perplexity(pool.chunk, total_docs=lencorpus)
 
-                # put the chunk into the workers' input job queue
-                chunk_put = False
-                while not chunk_put:
-                    try:
-                        job_queue.put((chunk_no, chunk, self), block=False, timeout=0.1)
-                        chunk_put = True
-                        queue_size[0] += 1
-                        logger.info(
-                            "PROGRESS: pass %i, dispatched chunk #%i = documents up to #%i/%i, "
-                            "outstanding queue size %i",
-                            pass_, chunk_no, chunk_no * self.chunksize + len(chunk), lencorpus, queue_size[0]
-                        )
-                    except queue.Full:
-                        # in case the input job queue is full, keep clearing the
-                        # result queue, to make sure we don't deadlock
-                        process_result_queue()
-
-                process_result_queue()
-            # endfor single corpus pass
-
-            # wait for all outstanding jobs to finish
-            while queue_size[0] > 0:
-                process_result_queue(force=True)
-
-            if reallen != lencorpus:
+            if pool.processed != lencorpus:
                 raise RuntimeError("input corpus size changed during training (don't use generators as input)")
         # endfor entire update
 
         pool.terminate()
 
 
-def worker_e_step(input_queue, result_queue):
+def worker_e_step(chunk, worker_lda):
     """Perform E-step for each job.
 
     Parameters
@@ -329,15 +294,6 @@ def worker_e_step(input_queue, result_queue):
         After the worker finished the job, the state of the resulting (trained) worker model is appended to this queue.
 
     """
-    logger.debug("worker process entering E-step loop")
-    while True:
-        logger.debug("getting a new job")
-        chunk_no, chunk, worker_lda = input_queue.get()
-        logger.debug("processing chunk #%i of %i documents", chunk_no, len(chunk))
-        worker_lda.state.reset()
-        worker_lda.do_estep(chunk)  # TODO: auto-tune alpha?
-        del chunk
-        logger.debug("processed chunk, queuing the result")
-        result_queue.put(worker_lda.state)
-        del worker_lda  # free up some memory
-        logger.debug("result put")
+    worker_lda.state.reset()
+    worker_lda.do_estep(chunk)  # TODO: auto-tune alpha?
+    return worker_lda.state

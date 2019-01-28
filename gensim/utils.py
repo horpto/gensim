@@ -29,6 +29,7 @@ import itertools
 import tempfile
 from functools import wraps
 import multiprocessing
+import queue
 import shutil
 import sys
 import subprocess
@@ -1308,6 +1309,96 @@ else:
         else:
             for chunk in chunkize_serial(corpus, chunksize, as_numpy=as_numpy):
                 yield chunk
+
+class MapPool(object):
+
+    def __init__(self, func, workers=None, initializer=None, initargs=None, queuesize=None):
+        if workers is None:
+            workers = cpu_count()
+        if queuesize is None:
+            queuesize = workers * 2
+
+        self.job_queue = multiprocessing.Queue(maxsize=queuesize)
+        self.result_queue = multiprocessing.Queue()
+        self.pool = multiprocessing.Pool(workers,
+            initializer=self._worker_starter,
+            initargs=(self.job_queue, self.result_queue, func, initializer, initargs))
+
+        # keep track of how many documents we've processed so far
+        # resetted before map
+        self.processed = 0
+        self.queue_watermark = 0
+        self.chunk = None
+
+    @staticmethod
+    def _worker_starter(job_queue, result_queue, func, initializer, initargs):
+        logger.debug("worker process started")
+        if initializer is not None:
+            if initargs is None:
+                initargs = ()
+            initializer(*initargs)
+
+        while True:
+            logger.debug("getting a new job")
+            chunk_no, chunk, args = job_queue.get()
+            logger.debug("processing chunk #%i of %i documents", chunk_no, len(chunk))
+            result = func(chunk, *args)
+            del chunk
+            logger.debug("processed chunk, queuing the result")
+            result_queue.put(result)
+            del result  # free up some memory
+            logger.debug("result put")
+
+    def map(self, iterable, args=None, chunksize=None, as_numpy=False):
+        self.queue_watermark = 0
+        self.processed = 0
+
+        if args is None:
+            args = ()
+
+        chunk_stream = enumerate(grouper(iterable, chunksize, as_numpy=as_numpy))
+        for chunk_no, self.chunk in chunk_stream:
+            self.processed += len(self.chunk)
+            # put the chunk into the workers' input job queue
+            job = (chunk_no, self.chunk, args)
+            while True:
+                try:
+                    self.job_queue.put(job, block=False)
+                    self.queue_watermark += 1
+                    logger.info(
+                        "PROGRESS: dispatched chunk #%i = documents up to #%i, "
+                        "outstanding queue size %i",
+                        chunk_no, chunk_no * chunksize + len(self.chunk), self.queue_watermark
+                    )
+                    break
+                except queue.Full:
+                    # in case the input job queue is full, keep clearing the
+                    # result queue, to make sure we don't deadlock
+                    while not self.result_queue.empty():
+                        self.queue_watermark -= 1
+                        yield self.result_queue.get()
+
+            if not self.result_queue.empty():
+                self.queue_watermark -= 1
+                yield self.result_queue.get()
+
+        # wait for all outstanding jobs to finish
+        while self.queue_watermark > 0:
+            self.queue_watermark -= 1
+            yield self.result_queue.get()
+        assert self.queue_watermark == 0, "All chunks should be processed, left %s chunks" % self.queue_watermark
+
+    def __del__(self):
+        self.terminate()
+    
+    def terminate(self):
+        self.pool.terminate()
+
+    def close(self):
+        self.pool.close()
+
+    def join(self):
+        self.pool.join()
 
 
 def smart_extension(fname, ext):
